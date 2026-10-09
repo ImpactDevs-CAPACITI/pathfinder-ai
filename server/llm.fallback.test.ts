@@ -21,7 +21,7 @@ function failResponse(text: string) {
   return { ok: false, status: 500, statusText: "Internal Server Error", headers: { get: () => null }, text: async () => text, body: { cancel: async () => {} } };
 }
 
-describe("invokeLLM provider fallback (Manus Forge primary, configurable OpenAI-compatible secondary)", () => {
+describe("invokeLLM provider preference (configured OpenAI-compatible provider before Manus Forge)", () => {
   const fetchMock = vi.fn();
 
   beforeEach(() => {
@@ -35,26 +35,34 @@ describe("invokeLLM provider fallback (Manus Forge primary, configurable OpenAI-
     vi.useRealTimers();
   });
 
-  it("uses the primary provider when it succeeds and never touches the fallback", async () => {
-    fetchMock.mockResolvedValueOnce(okResponse("primary ok"));
-    const { invokeLLM } = await loadLLM({ BUILT_IN_FORGE_API_KEY: "primary-key", BUILT_IN_FORGE_API_URL: "https://primary.example", FALLBACK_LLM_API_KEY: "fallback-key" });
+  it("uses the configured provider first when both providers are available", async () => {
+    fetchMock.mockResolvedValueOnce(okResponse("groq ok"));
+    const { invokeLLM } = await loadLLM({
+      BUILT_IN_FORGE_API_KEY: "manus-key",
+      BUILT_IN_FORGE_API_URL: "https://forge.example",
+      FALLBACK_LLM_API_KEY: "groq-key",
+      FALLBACK_LLM_API_URL: "https://api.groq.com/openai/v1",
+      FALLBACK_LLM_MODEL: "llama-3.3-70b-versatile",
+    });
 
     const result = await invokeLLM({ messages: [{ role: "user", content: "hi" }] });
 
-    expect(result.choices[0].message.content).toBe("primary ok");
+    expect(result.choices[0].message.content).toBe("groq ok");
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0][0]).toBe("https://primary.example/v1/chat/completions");
+    expect(fetchMock.mock.calls[0][0]).toBe("https://api.groq.com/openai/v1/chat/completions");
+    expect(fetchMock.mock.calls[0][1].headers.authorization).toBe("Bearer groq-key");
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).model).toBe("llama-3.3-70b-versatile");
   });
 
-  it("falls back to the configured provider (e.g. Groq) once the primary exhausts its retries, filling in a default model", async () => {
+  it("uses Manus Forge only if the configured provider exhausts its retries", async () => {
     vi.useFakeTimers();
-    // fetchWithBackoff retries the primary up to RETRY_MAX_RETRIES times (5 attempts total)
-    // before giving up and moving on to the fallback.
+    // fetchWithBackoff retries the configured provider up to five times before moving on.
     for (let i = 0; i < 5; i++) fetchMock.mockResolvedValueOnce(failResponse("primary down"));
-    fetchMock.mockResolvedValueOnce(okResponse("fallback ok"));
+    fetchMock.mockResolvedValueOnce(okResponse("manus backup ok"));
 
     const { invokeLLM } = await loadLLM({
-      BUILT_IN_FORGE_API_KEY: "primary-key",
+      BUILT_IN_FORGE_API_KEY: "manus-key",
+      BUILT_IN_FORGE_API_URL: "https://forge.example",
       FALLBACK_LLM_API_KEY: "groq-key",
       FALLBACK_LLM_API_URL: "https://api.groq.com/openai/v1",
       FALLBACK_LLM_MODEL: "llama-3.3-70b-versatile",
@@ -64,13 +72,12 @@ describe("invokeLLM provider fallback (Manus Forge primary, configurable OpenAI-
     await vi.runAllTimersAsync();
     const result = await promise;
 
-    expect(result.choices[0].message.content).toBe("fallback ok");
+    expect(result.choices[0].message.content).toBe("manus backup ok");
     expect(fetchMock).toHaveBeenCalledTimes(6);
-    const [fallbackUrl, fallbackInit] = fetchMock.mock.calls[5];
-    expect(fallbackUrl).toBe("https://api.groq.com/openai/v1/chat/completions");
-    expect(fallbackInit.headers.authorization).toBe("Bearer groq-key");
-    const body = JSON.parse(fallbackInit.body);
-    expect(body.model).toBe("llama-3.3-70b-versatile");
+    const [backupUrl, backupInit] = fetchMock.mock.calls[5];
+    expect(backupUrl).toBe("https://forge.example/v1/chat/completions");
+    expect(backupInit.headers.authorization).toBe("Bearer manus-key");
+    expect(JSON.parse(backupInit.body)).not.toHaveProperty("model");
   }, 20000);
 
   it("defaults the fallback base URL to OpenAI's API when no custom URL is set", async () => {
