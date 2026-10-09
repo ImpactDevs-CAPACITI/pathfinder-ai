@@ -137,3 +137,30 @@
 
 - [x] Add a server-side mocked-database test that directly calls saveConversationPathway and verifies promotion plus checklist insertion.
 - [x] Refactor saveConversationPathway/getDb only as needed to support dependency injection without changing production behavior.
+
+# Live application calendar and deadline reminders
+
+- [x] Drive calendar markers and selected-day details from current-user Applications deadlines, including the CAPACITI WIL 2026-09-20 case.
+- [x] Add live month/year navigation, month/year jump controls, and Today behavior with date-range query inputs.
+- [x] Source the required in-app deadline banner or badge from the existing Upcoming Deadlines data path.
+- [x] Keep calendar and reminder data live after application add, edit, status, deadline, or removal mutations.
+- [x] Add regression tests and complete responsive/browser verification for calendar and reminders.
+
+# Calendar verification corrections
+
+- [x] Reuse the main Applications table as the selected-day filtered view and verify CAPACITI WIL Accepted appears after selecting 20 September 2026.
+- [x] Add an explicit edit action for existing application rows and verify deadline edits update calendar markers and reminders live.
+- [x] Add integration coverage for applications.deadlines/applications.upcoming and mutation-driven refresh behavior.
+- [x] Complete desktop and mobile browser verification for the calendar and reminder surfaces.
+
+# Targeted runtime verification
+
+- [x] Verify the authenticated Applications click flow for 20 September 2026 and CAPACITI WIL Accepted.
+- [x] Verify deadline edit and removal behavior updates markers and reminders without refresh.
+- [x] Verify the actual Overview and Applications surfaces at desktop and mobile widths after the runtime import check.
+
+# Date-only deadline matching correction
+
+- [x] Normalize persisted date-only deadlines to calendar-date keys before applying visible-month and selected-day range filters.
+- [x] Add regression coverage proving 2026-09-20 is returned for the CAPACITI WIL Accepted scenario despite timezone offsets.
+- [x] Re-run authenticated marker and selected-day verification after the correction.

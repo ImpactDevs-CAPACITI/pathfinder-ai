@@ -19,16 +19,7 @@ async function assertDatabaseAvailable() {
 }
 
 const adminProcedure = protectedProcedure.use(({ ctx, next }) => { if (ctx.user.role !== "admin") throw new Error("Admin access required"); return next(); });
-import { addMessage, createApplication, createConversation, renameConversation, deleteConversation, listApplications, updateApplication, deleteApplication, listChecklistItems, listConversations, listMessages, listOpportunities, listPathways, listPromptLibrary, listSavedOpportunities, toggleSavedOpportunity, updateChecklist, upsertProfile, getProfile, searchLiveOpportunities, upsertPersonalisedPathwayDraft, saveConversationPathway } from "./db";
-
-// Issues one PathFinder session cookie the exact same way for a freshly registered account, a
-// returning local sign-in, and an OAuth login — everything downstream (tRPC context, protected
-// procedures) only ever looks at this one cookie, never at how the user authenticated.
-async function startLocalSession(res: import("express").Response, req: import("express").Request, user: { openId: string; name: string | null }) {
-  const sessionToken = await sdk.createSessionToken(user.openId, { name: user.name || "", expiresInMs: ONE_YEAR_MS });
-  const cookieOptions = getSessionCookieOptions(req);
-  res.cookie(COOKIE_NAME, sessionToken, { ...cookieOptions, maxAge: ONE_YEAR_MS });
-}
+import { addMessage, createApplication, createConversation, listApplications, listDeadlineItems, listUpcomingDeadlines, updateApplication, deleteApplication, listChecklistItems, listConversations, listMessages, listOpportunities, listPathways, listPromptLibrary, listSavedOpportunities, toggleSavedOpportunity, updateChecklist, upsertProfile, getProfile, searchLiveOpportunities, upsertPersonalisedPathwayDraft, saveConversationPathway } from "./db";
 
 const profileInput = z.object({ country: z.string().default("South Africa"), education: z.string().optional(), province: z.string().optional(), goal: z.string().optional(), interests: z.string().optional(), skills: z.string().optional(), experience: z.string().optional(), location: z.string().optional(), constraints: z.string().optional(), resources: z.string().optional() });
 // The chat guide extracts profile fields from freeform conversation as it goes (even dense,
@@ -104,14 +95,8 @@ export const appRouter = router({
     messages: protectedProcedure.input(z.object({ conversationId: z.number() })).query(({ ctx, input }) => listMessages(ctx.user.id, input.conversationId)),
     addMessage: protectedProcedure.input(z.object({ conversationId: z.number(), sender: z.enum(["user", "assistant"]), message: z.string().min(1) })).mutation(({ ctx, input }) => addMessage(ctx.user.id, input.conversationId, input.sender, input.message)),
   }),
-  applications: router({ list: protectedProcedure.query(({ ctx }) => listApplications(ctx.user.id)), create: protectedProcedure.input(applicationInput).mutation(({ ctx, input }) => createApplication(ctx.user.id, input)), update: protectedProcedure.input(applicationInput.partial().extend({ id: z.number() })).mutation(({ ctx, input }) => { const { id, ...data } = input; return updateApplication(ctx.user.id, id, data); }), remove: protectedProcedure.input(z.object({ id: z.number() })).mutation(({ ctx, input }) => deleteApplication(ctx.user.id, input.id)) }),
-  pathways: router({ list: protectedProcedure.query(({ ctx }) => listPathways(ctx.user.id)), checklist: protectedProcedure.input(z.object({ pathwayId: z.number() })).query(({ ctx, input }) => listChecklistItems(ctx.user.id, input.pathwayId)), toggleChecklist: protectedProcedure.input(z.object({ itemId: z.number(), isComplete: z.number().min(0).max(1) })).mutation(({ ctx, input }) => updateChecklist(ctx.user.id, input.itemId, input.isComplete)),
-    // The one deterministic save path: promotes whatever ready draft the guide has already
-    // persisted for this conversation. Returns null (no save, no error) if no ready draft
-    // exists — the client-side button is disabled before that point, but this guards the
-    // same rule server-side in case it's ever called directly.
-    save: protectedProcedure.input(z.object({ conversationId: z.number() })).mutation(({ ctx, input }) => saveConversationPathway(ctx.user.id, input.conversationId)),
-  }),
+  applications: router({ list: protectedProcedure.query(({ ctx }) => listApplications(ctx.user.id)), deadlines: protectedProcedure.input(z.object({ from: z.date(), to: z.date() })).query(({ ctx, input }) => listDeadlineItems(ctx.user.id, input.from, input.to)), upcoming: protectedProcedure.query(({ ctx }) => listUpcomingDeadlines(ctx.user.id)), create: protectedProcedure.input(applicationInput).mutation(({ ctx, input }) => createApplication(ctx.user.id, input)), update: protectedProcedure.input(applicationInput.partial().extend({ id: z.number() })).mutation(({ ctx, input }) => { const { id, ...data } = input; return updateApplication(ctx.user.id, id, data); }), remove: protectedProcedure.input(z.object({ id: z.number() })).mutation(({ ctx, input }) => deleteApplication(ctx.user.id, input.id)) }),
+  pathways: router({ list: protectedProcedure.query(({ ctx }) => listPathways(ctx.user.id)), checklist: protectedProcedure.input(z.object({ pathwayId: z.number() })).query(({ ctx, input }) => listChecklistItems(ctx.user.id, input.pathwayId)), toggleChecklist: protectedProcedure.input(z.object({ itemId: z.number(), isComplete: z.number().min(0).max(1) })).mutation(({ ctx, input }) => updateChecklist(ctx.user.id, input.itemId, input.isComplete)) }),
   guide: router({
     respond: protectedProcedure.input(z.object({ profile: z.string(), history: historyInput, message: z.string(), conversationId: z.number().optional() })).mutation(async ({ ctx, input }) => {
       if (input.conversationId) await addMessage(ctx.user.id, input.conversationId, "user", input.message);
