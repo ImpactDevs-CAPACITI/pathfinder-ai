@@ -2,7 +2,16 @@ import { AXIOS_TIMEOUT_MS, COOKIE_NAME, ONE_YEAR_MS, decodeOAuthState } from "@s
 import { ForbiddenError } from "@shared/_core/errors";
 import axios, { type AxiosInstance } from "axios";
 import { parse as parseCookieHeader } from "cookie";
-import type { Request } from "express";
+// Deliberately not importing Express's `Request` type here — see the identical note in
+// cookies.ts: `@types/express` (a devDependency) didn't resolve the same way in Vercel's
+// isolated per-function build as it does locally, and `authenticateRequest` only ever reads
+// two headers, so a minimal structural shape avoids that whole class of problem.
+type MinimalRequest = {
+  headers: {
+    cookie?: string;
+    authorization?: string;
+  };
+};
 import { SignJWT, jwtVerify } from "jose";
 import type { User } from "../../drizzle/schema";
 import * as db from "../db";
@@ -255,7 +264,26 @@ class SDKServer {
     } as GetUserInfoWithJwtResponse;
   }
 
-  async authenticateRequest(req: Request): Promise<AuthenticatedUser> {
+  private async getUserByOpenIdWithRetry(openId: string, attempts = 2): Promise<User | undefined> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      try {
+        const user = await db.getUserByOpenId(openId);
+        if (user) return user;
+        return undefined; // A genuinely empty result (no thrown error) isn't worth retrying.
+      } catch (error) {
+        lastError = error;
+        if (attempt < attempts - 1) {
+          console.warn(`[Auth] getUserByOpenId failed (attempt ${attempt + 1}/${attempts}), retrying:`, error instanceof Error ? error.message : error);
+          await new Promise(resolve => setTimeout(resolve, 250));
+        }
+      }
+    }
+    console.error("[Auth] getUserByOpenId failed after retries:", lastError instanceof Error ? lastError.message : lastError);
+    return undefined;
+  }
+
+  async authenticateRequest(req: MinimalRequest): Promise<AuthenticatedUser> {
     // 1. Prefer the session cookie (regular OAuth login).
     const cookies = this.parseCookies(req.headers.cookie);
     let sessionToken = cookies.get(COOKIE_NAME);
@@ -287,7 +315,12 @@ class SDKServer {
 
     const sessionUserId = session.openId;
     const signedInAt = new Date();
-    let user = await db.getUserByOpenId(sessionUserId);
+    // The JWT signature is already verified above — this person genuinely has a valid session.
+    // A single failed lookup here (managed-Postgres connection-pool cold start, a brief network
+    // blip) must not immediately read as "not logged in": for local email/password accounts the
+    // fallback below can never recover it (there's no OAuth server to sync from), so one hiccup
+    // would otherwise mean an instant, unrecoverable logout. Give the DB two tries first.
+    let user = await this.getUserByOpenIdWithRetry(sessionUserId);
 
     // If user not in DB, sync from OAuth server automatically
     if (!user) {

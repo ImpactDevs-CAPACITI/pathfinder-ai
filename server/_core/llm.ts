@@ -217,9 +217,23 @@ const resolveApiUrl = () =>
     ? `${ENV.forgeApiUrl.replace(/\/$/, "")}/v1/chat/completions`
     : "https://forge.manus.im/v1/chat/completions";
 
-const assertApiKey = () => {
-  if (!ENV.forgeApiKey) {
-    throw new Error("OPENAI_API_KEY is not configured");
+// Any OpenAI-compatible base URL works here (OpenAI itself, Groq, etc.) — this app already
+// speaks that exact request/response shape, so swapping providers is just a base URL/key/model
+// change, never a code change.
+const DEFAULT_FALLBACK_BASE_URL = "https://api.openai.com/v1";
+const resolveFallbackUrl = () => {
+  const base = ENV.fallbackApiUrl && ENV.fallbackApiUrl.trim().length > 0 ? ENV.fallbackApiUrl : DEFAULT_FALLBACK_BASE_URL;
+  return `${base.replace(/\/$/, "")}/chat/completions`;
+};
+
+const hasPrimaryProvider = () => Boolean(ENV.forgeApiKey);
+const hasFallbackProvider = () => Boolean(ENV.fallbackApiKey);
+
+const assertAnyProviderConfigured = () => {
+  if (!hasPrimaryProvider() && !hasFallbackProvider()) {
+    throw new Error(
+      "No LLM provider is configured: set BUILT_IN_FORGE_API_KEY (primary) and/or FALLBACK_LLM_API_KEY (fallback)"
+    );
   }
 };
 
@@ -340,7 +354,7 @@ const fetchWithBackoff = async (
 };
 
 export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
-  assertApiKey();
+  assertAnyProviderConfigured();
 
   const {
     messages,
@@ -401,54 +415,41 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
     payload.response_format = normalizedResponseFormat;
   }
 
-  const response = await fetchWithBackoff(resolveApiUrl(), {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${ENV.forgeApiKey}`,
-    },
-    body: JSON.stringify(payload),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(
-      `LLM invoke failed: ${response.status} ${response.statusText} – ${errorText}`
-    );
+  const attempts: { label: string; url: string; apiKey: string; body: Record<string, unknown> }[] = [];
+  if (hasPrimaryProvider()) {
+    attempts.push({ label: "primary (Manus Forge)", url: resolveApiUrl(), apiKey: ENV.forgeApiKey, body: payload });
+  }
+  if (hasFallbackProvider()) {
+    // The fallback provider requires `model` in the body; the primary tolerates it being omitted
+    // (it has its own default), so only fill it in for this attempt.
+    attempts.push({ label: "fallback", url: resolveFallbackUrl(), apiKey: ENV.fallbackApiKey, body: { ...payload, model: payload.model || ENV.fallbackModel } });
   }
 
-  return (await response.json()) as InvokeResult;
-}
+  let lastError: unknown;
+  for (let i = 0; i < attempts.length; i++) {
+    const attempt = attempts[i];
+    try {
+      const response = await fetchWithBackoff(attempt.url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${attempt.apiKey}`,
+        },
+        body: JSON.stringify(attempt.body),
+      });
 
-export type ModelInfo = {
-  id: string;
-  object: string;
-  created: number;
-  owned_by: string;
-};
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`LLM invoke failed: ${response.status} ${response.statusText} – ${errorText}`);
+      }
 
-export type ModelsResponse = {
-  object: string;
-  data: ModelInfo[];
-};
-
-export async function listLLMModels(): Promise<ModelsResponse> {
-  assertApiKey();
-
-  const url = ENV.forgeApiUrl && ENV.forgeApiUrl.trim().length > 0
-    ? `${ENV.forgeApiUrl.replace(/\/$/, "")}/v1/models`
-    : "https://forge.manus.im/v1/models";
-
-  const response = await fetchWithBackoff(url, {
-    headers: { authorization: `Bearer ${ENV.forgeApiKey}` },
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(
-      `List LLM models failed: ${response.status} ${response.statusText} – ${errorText}`
-    );
+      return (await response.json()) as InvokeResult;
+    } catch (error) {
+      lastError = error;
+      const isLastAttempt = i === attempts.length - 1;
+      console.warn(`[LLM] ${attempt.label} failed${isLastAttempt ? "" : ", trying fallback"}:`, error instanceof Error ? error.message : error);
+    }
   }
 
-  return (await response.json()) as ModelsResponse;
+  throw lastError instanceof Error ? lastError : new Error("All configured LLM providers failed");
 }

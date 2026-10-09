@@ -1,23 +1,85 @@
 import { z } from "zod";
-import { COOKIE_NAME } from "@shared/const";
+import { COOKIE_NAME, ONE_YEAR_MS } from "@shared/const";
+import { isValidEmail, normalizeEmail, passwordIssues } from "@shared/authValidation";
 import { getSessionCookieOptions } from "./_core/cookies";
+import { sdk } from "./_core/sdk";
 import { invokeLLM } from "./_core/llm";
 import { systemRouter } from "./_core/systemRouter";
 import { protectedProcedure, publicProcedure, router } from "./_core/trpc";
-import { isPathwayReady, shouldPersistPathway } from "../shared/pathwaySave";
-import { adminUpdateOpportunity, adminListOpportunities } from "./db";
+import { isPathwayReady } from "../shared/pathwaySave";
+import { hashPassword, verifyPassword } from "./passwordAuth";
+import { adminUpdateOpportunity, adminListOpportunities, createLocalUser, getDb, getUserByEmail, sanitizeUser } from "./db";
+
+// getUserByEmail/createLocalUser silently return undefined/null when the database is
+// unreachable, which would otherwise surface as a misleading "Incorrect email or password" —
+// check connectivity explicitly first so a real infrastructure problem reads honestly.
+async function assertDatabaseAvailable() {
+  const db = await getDb();
+  if (!db) throw new Error("We're having trouble reaching the database right now — please try again in a moment.");
+}
 
 const adminProcedure = protectedProcedure.use(({ ctx, next }) => { if (ctx.user.role !== "admin") throw new Error("Admin access required"); return next(); });
 import { addMessage, createApplication, createConversation, listApplications, listDeadlineItems, listUpcomingDeadlines, updateApplication, deleteApplication, listChecklistItems, listConversations, listMessages, listOpportunities, listPathways, listPromptLibrary, listSavedOpportunities, toggleSavedOpportunity, updateChecklist, upsertProfile, getProfile, searchLiveOpportunities, upsertPersonalisedPathwayDraft, saveConversationPathway } from "./db";
 
 const profileInput = z.object({ country: z.string().default("South Africa"), education: z.string().optional(), province: z.string().optional(), goal: z.string().optional(), interests: z.string().optional(), skills: z.string().optional(), experience: z.string().optional(), location: z.string().optional(), constraints: z.string().optional(), resources: z.string().optional() });
+// The chat guide extracts profile fields from freeform conversation as it goes (even dense,
+// multi-field messages). We only ever trust fields that are (a) one of these known profile
+// columns and (b) a non-empty string for that turn — anything else the model returns is dropped
+// rather than written to the database. Derived from profileInput so the two can't drift apart.
+const PROFILE_FIELD_KEYS = Object.keys(profileInput.shape) as (keyof z.infer<typeof profileInput>)[];
+// Strict JSON-schema mode (OpenAI, and OpenAI-compatible providers like Groq) rejects open-ended
+// dictionary objects — every property must be named explicitly, `additionalProperties` must be
+// the literal `false`, and everything must be listed in `required` (a field's "optional-ness" is
+// expressed by allowing `null`, not by omitting it from `required`). Built from the same
+// PROFILE_FIELD_KEYS so the schema and the extraction filter can never drift apart.
+const profileUpdatesSchema = {
+  type: "object",
+  properties: Object.fromEntries(PROFILE_FIELD_KEYS.map(key => [key, { type: ["string", "null"] }])),
+  required: [...PROFILE_FIELD_KEYS],
+  additionalProperties: false,
+} as const;
+function extractProfileUpdates(rawUpdates: unknown): Partial<Record<(typeof PROFILE_FIELD_KEYS)[number], string>> {
+  const source = rawUpdates && typeof rawUpdates === "object" ? (rawUpdates as Record<string, unknown>) : {};
+  const updates: Partial<Record<(typeof PROFILE_FIELD_KEYS)[number], string>> = {};
+  for (const key of PROFILE_FIELD_KEYS) {
+    const value = source[key];
+    if (typeof value === "string" && value.trim()) updates[key] = value.trim();
+  }
+  return updates;
+}
 const applicationInput = z.object({ title: z.string().min(2), organisation: z.string().min(2), type: z.enum(["Study", "Work", "Skills", "Business", "Other"]), dateApplied: z.date().optional(), deadlineDate: z.date().optional(), status: z.enum(["Not started", "Applied", "Interview", "Waiting", "Accepted", "Not this time", "Withdrawn"]).optional(), notes: z.string().optional(), linkedPathwayId: z.number().optional(), linkedOpportunityId: z.number().optional() });
 const historyInput = z.array(z.object({ role: z.enum(["user", "assistant"]), content: z.string() }));
 const pathwayResponseSchema = { type: "object", properties: { recommended_direction: { type: "string" }, goal: { type: "string" }, education: { type: "string" }, interests_or_skills: { type: "string" }, province: { type: "string" }, constraint: { type: "string" }, reasons: { type: "string" }, next_steps: { type: "array", items: { type: "string" } }, immediate_action: { type: "string" } }, required: ["recommended_direction", "goal", "education", "interests_or_skills", "province", "constraint", "reasons", "next_steps", "immediate_action"], additionalProperties: false } as const;
 
 export const appRouter = router({
   system: systemRouter,
-  auth: router({ me: publicProcedure.query(opts => opts.ctx.user), logout: publicProcedure.mutation(({ ctx }) => { const cookieOptions = getSessionCookieOptions(ctx.req); ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 }); return { success: true } as const; }) }),
+  auth: router({
+    me: publicProcedure.query(opts => (opts.ctx.user ? sanitizeUser(opts.ctx.user) : null)),
+    logout: publicProcedure.mutation(({ ctx }) => { const cookieOptions = getSessionCookieOptions(ctx.req); ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 }); return { success: true } as const; }),
+    register: publicProcedure.input(z.object({ name: z.string().trim().min(1, "Name is required").max(120), email: z.string().min(1), password: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+      await assertDatabaseAvailable();
+      const email = normalizeEmail(input.email);
+      if (!isValidEmail(email)) throw new Error("Enter a valid email address.");
+      const issues = passwordIssues(input.password);
+      if (issues.length) throw new Error(issues.join(" "));
+      const existing = await getUserByEmail(email);
+      if (existing) throw new Error("An account with this email already exists — try signing in instead.");
+      const passwordHash = await hashPassword(input.password);
+      const user = await createLocalUser({ email, name: input.name, passwordHash });
+      if (!user) throw new Error("Could not create your account right now — please try again.");
+      await startLocalSession(ctx.res, ctx.req, user);
+      return { success: true, user: sanitizeUser(user) } as const;
+    }),
+    login: publicProcedure.input(z.object({ email: z.string().min(1), password: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+      await assertDatabaseAvailable();
+      const email = normalizeEmail(input.email);
+      const user = await getUserByEmail(email);
+      const passwordOk = await verifyPassword(input.password, user?.passwordHash);
+      if (!user || !passwordOk) throw new Error("Incorrect email or password.");
+      await startLocalSession(ctx.res, ctx.req, user);
+      return { success: true, user: sanitizeUser(user) } as const;
+    }),
+  }),
   opportunities: router({ adminList: adminProcedure.query(() => adminListOpportunities()), adminUpdate: adminProcedure.input(z.object({ id: z.number(), name: z.string().min(2).optional(), organisation: z.string().min(2).optional(), description: z.string().min(2).optional(), sourceUrl: z.string().url().startsWith("https://").optional(), verificationStatus: z.enum(["verified", "needs_review"]).optional(), deadlineDate: z.date().nullable().optional(), province: z.string().optional() })).mutation(({ input }) => { const { id, ...data } = input; return adminUpdateOpportunity(id, data); }), liveSearch: publicProcedure.input(z.object({ query: z.string().optional(), category: z.string().optional(), province: z.string().optional() })).query(({ input }) => searchLiveOpportunities(input.query || "", input.category, input.province)),
     list: publicProcedure.input(z.object({ search: z.string().optional(), category: z.enum(["Study", "Work", "Skills", "Business"]).optional(), province: z.string().optional() }).optional()).query(({ input }) => listOpportunities(input?.search, input?.category, input?.province)),
     save: protectedProcedure.input(z.object({ opportunityId: z.number().optional(), snapshotData: z.string() })).mutation(({ ctx, input }) => toggleSavedOpportunity(ctx.user.id, input.opportunityId, input.snapshotData)),
@@ -28,6 +90,8 @@ export const appRouter = router({
   conversations: router({
     list: protectedProcedure.query(({ ctx }) => listConversations(ctx.user.id)),
     create: protectedProcedure.input(z.object({ title: z.string().optional() }).optional()).mutation(({ ctx, input }) => createConversation(ctx.user.id, input?.title)),
+    rename: protectedProcedure.input(z.object({ id: z.number(), title: z.string().trim().min(1).max(180) })).mutation(({ ctx, input }) => renameConversation(ctx.user.id, input.id, input.title)),
+    remove: protectedProcedure.input(z.object({ id: z.number() })).mutation(({ ctx, input }) => deleteConversation(ctx.user.id, input.id)),
     messages: protectedProcedure.input(z.object({ conversationId: z.number() })).query(({ ctx, input }) => listMessages(ctx.user.id, input.conversationId)),
     addMessage: protectedProcedure.input(z.object({ conversationId: z.number(), sender: z.enum(["user", "assistant"]), message: z.string().min(1) })).mutation(({ ctx, input }) => addMessage(ctx.user.id, input.conversationId, input.sender, input.message)),
   }),
@@ -36,21 +100,21 @@ export const appRouter = router({
   guide: router({
     respond: protectedProcedure.input(z.object({ profile: z.string(), history: historyInput, message: z.string(), conversationId: z.number().optional() })).mutation(async ({ ctx, input }) => {
       if (input.conversationId) await addMessage(ctx.user.id, input.conversationId, "user", input.message);
-      const response = await invokeLLM({ messages: [{ role: "system", content: "You are PathFinder, a warm South African youth career guide. Ask only one question at a time. Use Grade 10 reading level, stay practical and encouraging, never diagnose, never guarantee outcomes, and never invent an institution or opportunity. Return only JSON matching the schema. Set pathway to a real object only when the readiness bar is met: goal, education, interests or skills, province, and main constraint are all known from the profile or conversation. Otherwise pathway must be null. Set save_intent true only when the user's meaning clearly expresses intent to save, keep, record, or choose the current pathway. Do not set it for thanks, okay, general agreement, or continued exploration. When save_intent is true without a ready pathway, explain that a little more context is needed." }, { role: "user", content: `Profile context: ${input.profile}\nConversation so far: ${JSON.stringify(input.history)}\nNew message: ${input.message}` }], response_format: { type: "json_schema", json_schema: { name: "pathfinder_guide_response", strict: true, schema: { type: "object", properties: { reply: { type: "string" }, profile_updates: { type: "object", additionalProperties: { type: "string" } }, pathway: { anyOf: [{ ...pathwayResponseSchema }, { type: "null" }] }, save_intent: { type: "boolean" } }, required: ["reply", "profile_updates", "pathway", "save_intent"], additionalProperties: false } } } });
+      const response = await invokeLLM({ messages: [{ role: "system", content: "You are PathFinder, a warm South African youth career guide. Ask only one question at a time. Before that question, spend one short sentence genuinely responding to what they just told you — react to something specific, reflect it back in your own words, or say why it's useful to know — so it reads like a person who was actually listening, not a form collecting fields one at a time. Vary that opening every turn; never reuse the same acknowledgement phrasing twice in a row, and never pad it into more than one sentence. This matters most before a pathway is ready — once the readiness bar is met, keep replies warm but get out of the way of the 'Save this pathway' button. Read past typos, slang, and short or terse replies (a single word like 'coding' or 'money', a casual 'idk', a misspelled 'reommend') to the real intent and keywords behind them — never ask the user to rephrase something you can already understand, and never let a short message read as too thin to act on. Whenever the user asks for examples, options, ideas, or what you'd recommend — however that's phrased, including tersely or with typos — actually give 2 to 4 concrete, realistic examples (kinds of skills, roles, subjects, or first steps grounded in what you know about them, or general and widely true ones if you don't yet know enough) before or alongside your next question; a reply that only asks another question in response to a request for examples is not acceptable. Never name a specific institution, company, or programme as an example — only real search results should ever supply those. Use Grade 10 reading level, stay practical and encouraging, never diagnose, never guarantee outcomes, and never invent an institution or opportunity. Return only JSON matching the schema. In profile_updates, set a field to the plain string the user stated in their latest message when they mentioned it — including when several fields (for example goal, education, interests, skills, experience, location, province, and constraints) are all given together in one dense message — and set every field they did not mention this turn to null; never re-ask about a field already present in the profile context you were given. Set pathway to a real object only when the readiness bar is met: goal, education, interests or skills, province, and main constraint are all known from the profile or conversation. Otherwise pathway must be null. Once a pathway is ready, tell the user in plain language that they can save it using the 'Save this pathway' button in the pathway panel — never ask them to confirm or say 'yes' to save in chat, since saving now only happens through that button." }, { role: "user", content: `Profile context: ${input.profile}\nConversation so far: ${JSON.stringify(input.history)}\nNew message: ${input.message}` }], response_format: { type: "json_schema", json_schema: { name: "pathfinder_guide_response", strict: true, schema: { type: "object", properties: { reply: { type: "string" }, profile_updates: profileUpdatesSchema, pathway: { anyOf: [{ ...pathwayResponseSchema }, { type: "null" }] } }, required: ["reply", "profile_updates", "pathway"], additionalProperties: false } } } });
       const content = response.choices?.[0]?.message?.content; let parsed: any = null; try { parsed = typeof content === "string" ? JSON.parse(content) : null; } catch { parsed = null; }
       const message = typeof parsed?.reply === "string" ? parsed.reply : "I’m listening. Tell me a little more about what you want to explore.";
       if (input.conversationId) await addMessage(ctx.user.id, input.conversationId, "assistant", message);
+      const profileUpdates = extractProfileUpdates(parsed?.profile_updates);
+      if (Object.keys(profileUpdates).length) await upsertProfile(ctx.user.id, profileUpdates);
       const ready = isPathwayReady(parsed?.pathway);
-      const saveIntent = Boolean(parsed?.save_intent);
       const pathwayDraft = ready ? parsed.pathway : null;
-      let pathway = null;
       if (input.conversationId && ready) {
-        if (saveIntent && shouldPersistPathway(saveIntent, parsed.pathway)) pathway = await saveConversationPathway(ctx.user.id, input.conversationId);
-        else if (!saveIntent) await upsertPersonalisedPathwayDraft(ctx.user.id, input.conversationId, parsed.pathway, message);
+        // Keep the conversation's draft pathway current on every ready turn — saving itself
+        // is a separate, deliberate action (the "Save this pathway" button), not something
+        // triggered by parsing what the user typed here.
+        await upsertPersonalisedPathwayDraft(ctx.user.id, input.conversationId, parsed.pathway, message);
       }
-      const saveMessage = saveIntent && ready && !pathway ? "I have a ready direction, but I need to see it established in this conversation before I can save it. Keep exploring for one more turn, then ask me to save it." : message;
-      const exposedPathwayDraft = saveIntent ? (pathway ? pathwayDraft : null) : pathwayDraft;
-      return { message: saveIntent && !ready ? `${message} Once we have your goal, education, interests or skills, province, and main constraint, I can save a real pathway for you.` : saveMessage, pathway, pathwayDraft: input.conversationId ? exposedPathwayDraft : null, saveIntent, pathwayReady: ready && Boolean(input.conversationId) && (!saveIntent || Boolean(pathway)) };
+      return { message, pathwayDraft: input.conversationId ? pathwayDraft : null, pathwayReady: ready && Boolean(input.conversationId), profileUpdates };
     }),
   }),
   drafts: router({
