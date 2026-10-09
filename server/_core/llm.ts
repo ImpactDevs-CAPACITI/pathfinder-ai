@@ -416,13 +416,13 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
   }
 
   const attempts: { label: string; url: string; apiKey: string; body: Record<string, unknown> }[] = [];
-  if (hasPrimaryProvider()) {
-    attempts.push({ label: "primary (Manus Forge)", url: resolveApiUrl(), apiKey: ENV.forgeApiKey, body: payload });
-  }
   if (hasFallbackProvider()) {
-    // The fallback provider requires `model` in the body; the primary tolerates it being omitted
-    // (it has its own default), so only fill it in for this attempt.
-    attempts.push({ label: "fallback", url: resolveFallbackUrl(), apiKey: ENV.fallbackApiKey, body: { ...payload, model: payload.model || ENV.fallbackModel } });
+    // Prefer the configured OpenAI-compatible provider (e.g. Groq) so chat does not depend on
+    // Manus Forge credentials. It requires `model`; Forge can use its own default.
+    attempts.push({ label: "configured LLM provider", url: resolveFallbackUrl(), apiKey: ENV.fallbackApiKey, body: { ...payload, model: payload.model || ENV.fallbackModel } });
+  }
+  if (hasPrimaryProvider()) {
+    attempts.push({ label: "Manus Forge backup", url: resolveApiUrl(), apiKey: ENV.forgeApiKey, body: payload });
   }
 
   let lastError: unknown;
@@ -447,7 +447,7 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
     } catch (error) {
       lastError = error;
       const isLastAttempt = i === attempts.length - 1;
-      console.warn(`[LLM] ${attempt.label} failed${isLastAttempt ? "" : ", trying fallback"}:`, error instanceof Error ? error.message : error);
+      console.warn(`[LLM] ${attempt.label} failed${isLastAttempt ? "" : ", trying next provider"}:`, error instanceof Error ? error.message : error);
     }
   }
 

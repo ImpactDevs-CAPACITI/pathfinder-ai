@@ -4,6 +4,7 @@ import { useAuth } from "@/_core/hooks/useAuth";
 import { isManusLoginConfigured, startLogin } from "@/const";
 import { Streamdown } from "streamdown";
 import { trpc } from "@/lib/trpc";
+import { isValidEmail, passwordIssues } from "@shared/authValidation";
 import { rollbackApplicationStatus } from "@shared/applicationState";
 import { canOfferSavePathway } from "@shared/pathwaySave";
 import { deadlineDateKey, deadlineTone, groupDeadlinesByDate } from "@shared/deadlineCalendar";
